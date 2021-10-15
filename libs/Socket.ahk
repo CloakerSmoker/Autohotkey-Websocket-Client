@@ -254,13 +254,26 @@ class SocketUDP extends Socket
 	}
 }
 
+MoveMemory(pTo, pFrom, Size) {
+	DllCall("RtlMoveMemory", "Ptr", pTo, "Ptr", pFrom, "UInt", Size)
+}
+
+
 class ClientSocketTLS extends SocketTCP {
 
 	__New(Hostname) {
 		this.Hostname := Hostname
 
 		SocketTCP.__New.Call(this)
+
+		this.RawSend := SocketTCP.Send
 	}
+
+	static NOT_TLS := 0
+	static WAIT_FOR_SERVER_HELLO := 1
+	static TLS := 2
+
+	State := ClientSocketTLS.NOT_TLS
 
 	static SEC_E_OK := 0
 
@@ -282,7 +295,7 @@ class ClientSocketTLS extends SocketTCP {
 
 		static SECPKG_CRED_OUTBOUND := 0x2
 
-		this.SetCapacity("CredHandle", 2 * A_PtrSize)
+		this.SetCapacity("CredHandle", A_PtrSize * 2)
 		this.SetCapacity("TimeStamp", A_PtrSize)
 
 		Status := DllCall("Secur32.dll\AcquireCredentialsHandle"
@@ -303,22 +316,24 @@ class ClientSocketTLS extends SocketTCP {
 	
 	static SEC_I_CONTINUE_NEEDED := 0x00090312
 
+	static ISC_REQ_ALLOCATE_MEMORY        := 0x00000100
+	static ISC_REQ_CONFIDENTIALITY        := 0x00000010
+	static ISC_REQ_EXTENDED_ERROR         := 0x00004000
+	static ISC_REQ_REPLAY_DETECT          := 0x00004000
+	static ISC_REQ_SEQUENCE_DETECT        := 0x00000008
+	static ISC_REQ_STREAM                 := 0x00008000
+	static ISC_REQ_MANUAL_CRED_VALIDATION := 0x00080000
+
+	static Flags := ClientSocketTLS.ISC_REQ_ALLOCATE_MEMORY | ClientSocketTLS.ISC_REQ_CONFIDENTIALITY
+		| ClientSocketTLS.ISC_REQ_EXTENDED_ERROR | ClientSocketTLS.ISC_REQ_REPLAY_DETECT
+		| ClientSocketTLS.ISC_REQ_SEQUENCE_DETECT | ClientSocketTLS.ISC_REQ_STREAM 
+		| ClientSocketTLS.ISC_REQ_MANUAL_CRED_VALIDATION
+
 	ClientHello() {
-		static ISC_REQ_ALLOCATE_MEMORY        := 0x00000100
-		static ISC_REQ_CONFIDENTIALITY        := 0x00000010
-		static ISC_REQ_EXTENDED_ERROR         := 0x00004000
-        static ISC_REQ_REPLAY_DETECT          := 0x00004000
-		static ISC_REQ_SEQUENCE_DETECT        := 0x00000008
-		static ISC_REQ_STREAM                 := 0x00008000
-        static ISC_REQ_MANUAL_CRED_VALIDATION := 0x00080000
-
-		static Flags := ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY | ISC_REQ_EXTENDED_ERROR | ISC_REQ_REPLAY_DETECT
-		 | ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM | ISC_REQ_MANUAL_CRED_VALIDATION
-
 		static SECBUFFER_VERSION := 0
 		static SECBUFFER_TOKEN := 2
 
-		this.SetCapacity("ContextHandle", A_PtrSize)
+		this.SetCapacity("ContextHandle", A_PtrSize * 2)
 
 		VarSetCapacity(SecBufferDescription, 8 + A_PtrSize, 0)
 		VarSetCapacity(SecBuffer, 8 + A_PtrSize, 0)
@@ -333,7 +348,7 @@ class ClientSocketTLS extends SocketTCP {
 			, "Ptr", this.GetAddress("CredHandle")
 			, "Ptr", 0
 			, "Str", this.HostName
-			, "UInt", Flags
+			, "UInt", this.Flags
 			, "Ptr", 0
 			, "Ptr", 0
 			, "Ptr", 0
@@ -344,19 +359,223 @@ class ClientSocketTLS extends SocketTCP {
 			, "Ptr", this.GetAddress("TimeStamp"))
 
 		if (Status != this.SEC_I_CONTINUE_NEEDED) {
-			Throw Exception("InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+			Throw Exception("ClientHello InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
 		}
 
 		Size := NumGet(SecBuffer, 0, "UInt")
 		pData := NumGet(SecBuffer, 8, "Ptr")
 
-		this.Send(pData, Size)
+		this.RawSend(pData, Size)
 
 		DllCall("Secur32.dll\FreeContextBuffer", "Ptr", pData)
+
+		this.State := ClientSocketTLS.WAIT_FOR_SERVER_HELLO
 	}
 
 	StartTLS() {
 		this.CreateCred()
 		this.ClientHello()
+
+		this.SetCapacity("ServerHelloData", 1)
+	}
+
+	ServerHelloSize := 0
+	ServerHelloBias := 0
+
+	static SEC_E_INCOMPLETE_MESSAGE := 0x80090318
+
+	OnRecv() {
+		static SECBUFFER_VERSION := 0
+		static SECBUFFER_EMPTY := 0
+		static SECBUFFER_TOKEN := 2
+		static SECBUFFER_EXTRA := 5
+
+		DataSize := this.MsgSize()
+		VarSetCapacity(Data, DataSize)
+		
+        this.Recv(Data, DataSize)
+
+		if (this.State = ClientSocketTLS.WAIT_FOR_SERVER_HELLO) {
+			Offset := this.ServerHelloSize
+			this.ServerHelloSize += DataSize
+
+			this.SetCapacity("ServerHelloData", this.ServerHelloSize)
+
+			MoveMemory(this.GetAddress("ServerHelloData"), &Data, DataSize)
+
+			Status := this.SEC_I_CONTINUE_NEEDED
+
+			pProtocolData := this.GetAddress("ServerHelloData")
+			ProtocolDataSize := this.ServerHelloSize
+
+			while (ProtocolDataSize != 0) {
+				static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
+				static SIZEOF_SECBUFFER     := 8 + A_PtrSize
+
+				; Input buffers
+
+				VarSetCapacity(InBuffers, SIZEOF_SECBUFFER * 2)
+
+				NumPut(ProtocolDataSize, InBuffers, 0, "UInt") ; SecBuffer.Size = 
+				NumPut(SECBUFFER_TOKEN , InBuffers, 4, "UInt") ; SecBuffer.Type = 
+				NumPut(pProtocolData   , InBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+				NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 0, "UInt") ; SecBuffer.Size = 
+				NumPut(SECBUFFER_EMPTY, InBuffers, SIZEOF_SECBUFFER + 4, "UInt") ; SecBuffer.Type = 
+				NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 8, "Ptr")  ; SecBuffer.Ptr = 
+
+				VarSetCapacity(InDesc, SIZEOF_SECBUFFERDESC)
+
+				NumPut(SECBUFFER_VERSION, InDesc, 0, "UInt") ; SecBufferDesc.Version =
+				NumPut(2                , InDesc, 4, "UInt") ; SecBufferDesc.Count =
+				NumPut(&InBuffers       , InDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+
+				; Output buffer
+
+				VarSetCapacity(OutBuffer, SIZEOF_SECBUFFER)
+
+				NumPut(0              , OutBuffer, 0, "UInt") ; SecBuffer.Size = 
+				NumPut(SECBUFFER_TOKEN, OutBuffer, 4, "UInt") ; SecBuffer.Type = 
+				NumPut(0              , OutBuffer, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+				VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC)
+
+				NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
+				NumPut(1                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
+				NumPut(&OutBuffer       , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+
+
+				Status := DllCall("Secur32.dll\InitializeSecurityContext"
+					, "Ptr", this.GetAddress("CredHandle")
+					, "Ptr", this.GetAddress("ContextHandle")
+					, "Str", this.HostName
+					, "UInt", this.Flags
+					, "Ptr", 0
+					, "Ptr", 0
+					, "Ptr", &InDesc
+					, "Ptr", 0
+					, "Ptr", 0
+					, "Ptr", &OutDesc
+					, "UInt*", OutFlags
+					, "Ptr", this.GetAddress("TimeStamp")
+					, "UInt")
+
+				if ((OutSize := NumGet(OutBuffer, 0, "UInt")) != 0 && (pOutData := NumGet(OutBuffer, 8, "Ptr")) != 0) {
+					this.RawSend(pOutData, OutSize)
+
+					DllCall("Secur32.dll\FreeContextBuffer", "Ptr", pOutData)
+				}
+
+				HasExtraData := NumGet(&InBuffers + SIZEOF_SECBUFFER, 4, "UInt") = SECBUFFER_EXTRA
+
+				if (Status = this.SEC_E_INCOMPLETE_MESSAGE) {
+					return
+				}
+				else if (Status = this.SEC_I_CONTINUE_NEEDED) {
+					if (HasExtraData) {
+						;OldProtocolDataSize := ProtocolDataSize
+
+						;ProtocolDataSize := NumGet(&InBuffers + SIZEOF_SECBUFFER, 0, "UInt")
+						;pProtocolData := pProtocolData + OldProtocolDataSize - ProtocolDataSize
+
+						ExtraDataSize := NumGet(&InBuffers + SIZEOF_SECBUFFER, 0, "UInt")
+
+						MoveMemory(pProtocolData, pProtocolData + (ProtocolDataSize - ExtraDataSize), ExtraDataSize)
+
+						ProtocolDataSize := ExtraDataSize
+
+						;NumPut(ProtocolDataSize, InBuffers, 0, "UInt") ; SecBuffer.Size = 
+						;NumPut(pProtocolData   , InBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
+					}
+
+					continue
+				}
+				else if (Status = ClientSocketTLS.SEC_E_OK) {
+					break
+				}
+				else {
+					Throw Exception("ServerHello InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+				}
+			}
+
+			static SECPKG_ATTR_STREAM_SIZES := 4
+
+			VarSetCapacity(StreamSizes, 20, 0)
+			
+			Status := DllCall("Secur32.dll\QueryContextAttributes"
+				, "Ptr", this.GetAddress("ContextHandle")
+				, "UInt", SECPKG_ATTR_STREAM_SIZES
+				, "Ptr", &StreamSizes)
+
+			if (Status != ClientSocketTLS.SEC_E_OK) {
+				Throw Exception("ServerHello QueryContextAttributes failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+			}
+
+			this.HeaderSize         := NumGet(StreamSizes, 0, "UInt")
+			this.TrailerSize        := NumGet(StreamSizes, 4, "UInt")
+			this.MaximumMessageSize := NumGet(StreamSizes, 8, "UInt")
+			this.BufferCount        := NumGet(StreamSizes, 12, "UInt")
+			this.BlockSize          := NumGet(StreamSizes, 16, "UInt")
+
+			this.MaxPayloadSize := this.MaximumMessageSize - this.HeaderSize - this.TrailerSize
+
+			this.State := ClientSocketTLS.TLS
+		}
+	}
+
+	Send(pBuffer, Size) {
+		if (this.State != ClientSocketTLS.TLS) {
+			Throw Exception("The TLS handshake has not been completed, and data cannot be safely sent over the socket")
+		}
+
+		VarSetCapacity(MessageBuffer, this.HeaderSize + Size + this.TrailerSize, 0)
+
+		;MoveMemory(&MessageBuffer + this.HeaderSize, pBuffer, Size)
+
+		loop, % DataSize {
+			Index := A_Index - 1
+
+			NumPut(NumGet(pBuffer + 0, Index, "Byte"), MessageBuffer, Index, "Byte")
+		}
+
+		static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
+		static SIZEOF_SECBUFFER     := 8 + A_PtrSize
+
+		VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC, 0)
+		VarSetCapacity(OutBuffers, SIZEOF_SECBUFFER * 4, 0)
+
+		static SECBUFFER_EMPTY := 0
+		static SECBUFFER_DATA := 1
+		static SECBUFFER_STREAM_TRAILER := 6
+		static SECBUFFER_STREAM_HEADER := 7
+
+		NumPut(this.HeaderSize        , OutBuffers, 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_STREAM_HEADER, OutBuffers, 4, "UInt") ; SecBuffer.Type = 
+		NumPut(&MessageBuffer         , OutBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(Size                            , OutBuffers, SIZEOF_SECBUFFER + 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_DATA                  , OutBuffers, SIZEOF_SECBUFFER + 4, "UInt") ; SecBuffer.Type = 
+		NumPut(&MessageBuffer + this.HeaderSize, OutBuffers, SIZEOF_SECBUFFER + 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(this.TrailerSize                       , OutBuffers, (SIZEOF_SECBUFFER * 2) + 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_STREAM_TRAILER               , OutBuffers, (SIZEOF_SECBUFFER * 2) + 4, "UInt") ; SecBuffer.Type = 
+		NumPut(&MessageBuffer + this.HeaderSize + Size, OutBuffers, (SIZEOF_SECBUFFER * 2) + 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(0              , OutBuffers, (SIZEOF_SECBUFFER * 3) + 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_EMPTY, OutBuffers, (SIZEOF_SECBUFFER * 3) + 4, "UInt") ; SecBuffer.Type = 
+		NumPut(0              , OutBuffers, (SIZEOF_SECBUFFER * 3) + 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
+		NumPut(4                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
+		NumPut(&OutBuffers      , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+
+		Status := DllCall("Secur32.dll\EncryptMessage"
+			, "Ptr", this.GetAddress("ContextHandle")
+			, "Ptr", 0
+			, "Ptr", &OutDesc
+			, "Ptr", 0
+			, "UInt")
+		
+		this.RawSend(&MessageBuffer, this.HeaderSize + Size + this.TrailerSize)
 	}
 }
