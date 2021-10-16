@@ -260,6 +260,19 @@ MoveMemory(pTo, pFrom, Size) {
 
 
 class ClientSocketTLS extends SocketTCP {
+	BlockingRecv(pBuffer, Size, Flags = 0) {
+		VarSetCapacity(ReadSet, A_PtrSize + (64 * A_PtrSize), 0)
+
+		NumPut(1          , ReadSet, 0        , "UInt")
+		NumPut(this.Socket, ReadSet, A_PtrSize, "Ptr")
+
+		if ((r := DllCall("Ws2_32\select", "UInt", 0, "Ptr", &ReadSet, "Ptr", 0, "Ptr", 0, "Ptr", 0, "Int")) == -1)
+			throw Exception("Error calling select",, this.GetLastError())
+
+		if ((r := DllCall("Ws2_32\recv", "UInt", this.Socket, "Ptr", pBuffer, "Int", Size, "Int", Flags)) == -1)
+			throw Exception("Error calling recv",, this.GetLastError())
+		return r
+	}
 
 	__New(Hostname) {
 		this.Hostname := Hostname
@@ -357,6 +370,8 @@ class ClientSocketTLS extends SocketTCP {
 			, "Ptr", &SecBufferDescription
 			, "UInt*", OutFlags
 			, "Ptr", this.GetAddress("TimeStamp"))
+		
+		this.Flags := OutFlags
 
 		if (Status != this.SEC_I_CONTINUE_NEEDED) {
 			Throw Exception("ClientHello InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
@@ -372,155 +387,140 @@ class ClientSocketTLS extends SocketTCP {
 		this.State := ClientSocketTLS.WAIT_FOR_SERVER_HELLO
 	}
 
-	StartTLS() {
-		this.CreateCred()
-		this.ClientHello()
-
-		this.SetCapacity("ServerHelloData", 1)
-	}
-
-	ServerHelloSize := 0
-	ServerHelloBias := 0
-
 	static SEC_E_INCOMPLETE_MESSAGE := 0x80090318
 
-	OnRecv() {
+	HandshakeLoop() {
 		static SECBUFFER_VERSION := 0
 		static SECBUFFER_EMPTY := 0
 		static SECBUFFER_TOKEN := 2
 		static SECBUFFER_EXTRA := 5
 
-		DataSize := this.MsgSize()
-		VarSetCapacity(Data, DataSize)
-		
-        this.Recv(Data, DataSize)
+		HandshakeBufferSize := 2 ** 16 - 1
+		VarSetCapacity(HandshakeBuffer, HandshakeBufferSize)
+		HandshakeBufferIndex := 0
 
-		if (this.State = ClientSocketTLS.WAIT_FOR_SERVER_HELLO) {
-			Offset := this.ServerHelloSize
-			this.ServerHelloSize += DataSize
+		Status := this.SEC_I_CONTINUE_NEEDED
 
-			this.SetCapacity("ServerHelloData", this.ServerHelloSize)
+		while (Status = this.SEC_I_CONTINUE_NEEDED || Status = this.SEC_E_INCOMPLETE_MESSAGE) {
+			if (HandshakeBufferIndex = 0 || Status = this.SEC_E_INCOMPLETE_MESSAGE) {
+				HandshakeBufferIndex += this.BlockingRecv(&HandshakeBuffer + HandshakeBufferIndex, HandshakeBufferSize - HandshakeBufferIndex)
+			}
 
-			MoveMemory(this.GetAddress("ServerHelloData"), &Data, DataSize)
+			static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
+			static SIZEOF_SECBUFFER     := 8 + A_PtrSize
 
-			Status := this.SEC_I_CONTINUE_NEEDED
+			; Input buffers
 
-			pProtocolData := this.GetAddress("ServerHelloData")
-			ProtocolDataSize := this.ServerHelloSize
+			VarSetCapacity(InBuffers, SIZEOF_SECBUFFER * 2)
 
-			while (ProtocolDataSize != 0) {
-				static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
-				static SIZEOF_SECBUFFER     := 8 + A_PtrSize
+			NumPut(HandshakeBufferIndex, InBuffers, 0, "UInt") ; SecBuffer.Size = 
+			NumPut(SECBUFFER_TOKEN     , InBuffers, 4, "UInt") ; SecBuffer.Type = 
+			NumPut(&HandshakeBuffer    , InBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
 
-				; Input buffers
+			NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 0, "UInt") ; SecBuffer.Size = 
+			NumPut(SECBUFFER_EMPTY, InBuffers, SIZEOF_SECBUFFER + 4, "UInt") ; SecBuffer.Type = 
+			NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 8, "Ptr")  ; SecBuffer.Ptr = 
 
-				VarSetCapacity(InBuffers, SIZEOF_SECBUFFER * 2)
+			VarSetCapacity(InDesc, SIZEOF_SECBUFFERDESC)
 
-				NumPut(ProtocolDataSize, InBuffers, 0, "UInt") ; SecBuffer.Size = 
-				NumPut(SECBUFFER_TOKEN , InBuffers, 4, "UInt") ; SecBuffer.Type = 
-				NumPut(pProtocolData   , InBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
+			NumPut(SECBUFFER_VERSION, InDesc, 0, "UInt") ; SecBufferDesc.Version =
+			NumPut(2                , InDesc, 4, "UInt") ; SecBufferDesc.Count =
+			NumPut(&InBuffers       , InDesc, 8, "Ptr")  ; SecBufferDesc.Data =
 
-				NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 0, "UInt") ; SecBuffer.Size = 
-				NumPut(SECBUFFER_EMPTY, InBuffers, SIZEOF_SECBUFFER + 4, "UInt") ; SecBuffer.Type = 
-				NumPut(0              , InBuffers, SIZEOF_SECBUFFER + 8, "Ptr")  ; SecBuffer.Ptr = 
+			; Output buffer
 
-				VarSetCapacity(InDesc, SIZEOF_SECBUFFERDESC)
+			VarSetCapacity(OutBuffer, SIZEOF_SECBUFFER)
 
-				NumPut(SECBUFFER_VERSION, InDesc, 0, "UInt") ; SecBufferDesc.Version =
-				NumPut(2                , InDesc, 4, "UInt") ; SecBufferDesc.Count =
-				NumPut(&InBuffers       , InDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+			NumPut(0              , OutBuffer, 0, "UInt") ; SecBuffer.Size = 
+			NumPut(SECBUFFER_TOKEN, OutBuffer, 4, "UInt") ; SecBuffer.Type = 
+			NumPut(0              , OutBuffer, 8, "Ptr")  ; SecBuffer.Ptr = 
 
-				; Output buffer
+			VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC)
 
-				VarSetCapacity(OutBuffer, SIZEOF_SECBUFFER)
-
-				NumPut(0              , OutBuffer, 0, "UInt") ; SecBuffer.Size = 
-				NumPut(SECBUFFER_TOKEN, OutBuffer, 4, "UInt") ; SecBuffer.Type = 
-				NumPut(0              , OutBuffer, 8, "Ptr")  ; SecBuffer.Ptr = 
-
-				VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC)
-
-				NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
-				NumPut(1                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
-				NumPut(&OutBuffer       , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+			NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
+			NumPut(1                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
+			NumPut(&OutBuffer       , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
 
 
-				Status := DllCall("Secur32.dll\InitializeSecurityContext"
-					, "Ptr", this.GetAddress("CredHandle")
-					, "Ptr", this.GetAddress("ContextHandle")
-					, "Str", this.HostName
-					, "UInt", this.Flags
-					, "Ptr", 0
-					, "Ptr", 0
-					, "Ptr", &InDesc
-					, "Ptr", 0
-					, "Ptr", 0
-					, "Ptr", &OutDesc
-					, "UInt*", OutFlags
-					, "Ptr", this.GetAddress("TimeStamp")
-					, "UInt")
+			Status := DllCall("Secur32.dll\InitializeSecurityContext"
+				, "Ptr", this.GetAddress("CredHandle")
+				, "Ptr", this.GetAddress("ContextHandle")
+				, "Ptr", 0
+				, "UInt", this.Flags
+				, "Ptr", 0
+				, "Ptr", 0
+				, "Ptr", &InDesc
+				, "Ptr", 0
+				, "Ptr", 0
+				, "Ptr", &OutDesc
+				, "UInt*", OutFlags
+				, "Ptr", this.GetAddress("TimeStamp")
+				, "UInt")
 
+			if (Status = this.SEC_E_OK || Status = this.SEC_I_CONTINUE_NEEDED) {
 				if ((OutSize := NumGet(OutBuffer, 0, "UInt")) != 0 && (pOutData := NumGet(OutBuffer, 8, "Ptr")) != 0) {
 					this.RawSend(pOutData, OutSize)
 
 					DllCall("Secur32.dll\FreeContextBuffer", "Ptr", pOutData)
 				}
-
-				HasExtraData := NumGet(&InBuffers + SIZEOF_SECBUFFER, 4, "UInt") = SECBUFFER_EXTRA
-
-				if (Status = this.SEC_E_INCOMPLETE_MESSAGE) {
-					return
-				}
-				else if (Status = this.SEC_I_CONTINUE_NEEDED) {
-					if (HasExtraData) {
-						;OldProtocolDataSize := ProtocolDataSize
-
-						;ProtocolDataSize := NumGet(&InBuffers + SIZEOF_SECBUFFER, 0, "UInt")
-						;pProtocolData := pProtocolData + OldProtocolDataSize - ProtocolDataSize
-
-						ExtraDataSize := NumGet(&InBuffers + SIZEOF_SECBUFFER, 0, "UInt")
-
-						MoveMemory(pProtocolData, pProtocolData + (ProtocolDataSize - ExtraDataSize), ExtraDataSize)
-
-						ProtocolDataSize := ExtraDataSize
-
-						;NumPut(ProtocolDataSize, InBuffers, 0, "UInt") ; SecBuffer.Size = 
-						;NumPut(pProtocolData   , InBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
-					}
-
-					continue
-				}
-				else if (Status = ClientSocketTLS.SEC_E_OK) {
-					break
-				}
-				else {
-					Throw Exception("ServerHello InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
-				}
 			}
 
-			static SECPKG_ATTR_STREAM_SIZES := 4
+			if (Status = this.SEC_E_INCOMPLETE_MESSAGE) {
+				continue
+			}
 
-			VarSetCapacity(StreamSizes, 20, 0)
+			HasExtraData := NumGet(&InBuffers + SIZEOF_SECBUFFER, 4, "UInt") = SECBUFFER_EXTRA
 			
-			Status := DllCall("Secur32.dll\QueryContextAttributes"
-				, "Ptr", this.GetAddress("ContextHandle")
-				, "UInt", SECPKG_ATTR_STREAM_SIZES
-				, "Ptr", &StreamSizes)
+			if (Status = this.SEC_E_OK) {
+				if (HasExtraData) {
+					; TODO: handle
+				}
 
-			if (Status != ClientSocketTLS.SEC_E_OK) {
-				Throw Exception("ServerHello QueryContextAttributes failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+				break
 			}
+			else if (Status & 0x80000000) {
+				Throw Exception("ServerHello InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+			}
+			
+			if (HasExtraData) {
+				ExtraDataSize := NumGet(&InBuffers + SIZEOF_SECBUFFER, 0, "UInt")
 
-			this.HeaderSize         := NumGet(StreamSizes, 0, "UInt")
-			this.TrailerSize        := NumGet(StreamSizes, 4, "UInt")
-			this.MaximumMessageSize := NumGet(StreamSizes, 8, "UInt")
-			this.BufferCount        := NumGet(StreamSizes, 12, "UInt")
-			this.BlockSize          := NumGet(StreamSizes, 16, "UInt")
-
-			this.MaxPayloadSize := this.MaximumMessageSize - this.HeaderSize - this.TrailerSize
-
-			this.State := ClientSocketTLS.TLS
+				MoveMemory(&HandshakeBuffer, &HandshakeBuffer + (HandshakeBufferIndex - ExtraDataSize), ExtraDataSize)
+			}
+			else {
+				HandshakeBufferIndex := 0
+			}
 		}
+
+		static SECPKG_ATTR_STREAM_SIZES := 4
+
+		VarSetCapacity(StreamSizes, 20, 0)
+		
+		Status := DllCall("Secur32.dll\QueryContextAttributes"
+			, "Ptr", this.GetAddress("ContextHandle")
+			, "UInt", SECPKG_ATTR_STREAM_SIZES
+			, "Ptr", &StreamSizes)
+
+		if (Status != ClientSocketTLS.SEC_E_OK) {
+			Throw Exception("ServerHello QueryContextAttributes failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+		}
+
+		this.HeaderSize         := NumGet(StreamSizes, 0, "UInt")
+		this.TrailerSize        := NumGet(StreamSizes, 4, "UInt")
+		this.MaximumMessageSize := NumGet(StreamSizes, 8, "UInt")
+		this.BufferCount        := NumGet(StreamSizes, 12, "UInt")
+		this.BlockSize          := NumGet(StreamSizes, 16, "UInt")
+
+		this.MaxPayloadSize := this.MaximumMessageSize - this.HeaderSize - this.TrailerSize
+
+		this.State := ClientSocketTLS.TLS
+	}
+
+	StartTLS() {
+		this.CreateCred()
+		this.ClientHello()
+
+		this.HandshakeLoop()
 	}
 
 	Send(pBuffer, Size) {
@@ -530,13 +530,7 @@ class ClientSocketTLS extends SocketTCP {
 
 		VarSetCapacity(MessageBuffer, this.HeaderSize + Size + this.TrailerSize, 0)
 
-		;MoveMemory(&MessageBuffer + this.HeaderSize, pBuffer, Size)
-
-		loop, % DataSize {
-			Index := A_Index - 1
-
-			NumPut(NumGet(pBuffer + 0, Index, "Byte"), MessageBuffer, Index, "Byte")
-		}
+		MoveMemory(&MessageBuffer + this.HeaderSize, pBuffer, Size)
 
 		static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
 		static SIZEOF_SECBUFFER     := 8 + A_PtrSize

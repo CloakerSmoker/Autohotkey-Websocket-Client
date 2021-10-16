@@ -1,8 +1,8 @@
 #Include Socket.ahk
 
-A := new ClientSocketTLS("balls")
+A := new ClientSocketTLS("ball")
 
-A.Connect(["172.31.73.101", 8080])
+A.Connect(["172.20.126.15", 8080])
 
 A.StartTLS()
 Sleep, 1000
@@ -10,4 +10,8 @@ Sleep, 1000
 
 T := "Hello world!"
 
-A.Send(&T, StrPut(T))
+SendSize := StrPut(T, "UTF-8")
+VarSetCapacity(SendBuffer, SendSize, 0)
+StrPut(T, &SendBuffer, "UTF-8")
+
+A.Send(&SendBuffer, SendSize)
