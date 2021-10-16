@@ -280,6 +280,7 @@ class ClientSocketTLS extends SocketTCP {
 		SocketTCP.__New.Call(this)
 
 		this.RawSend := SocketTCP.Send
+		this.RawRecv := SocketTCP.Recv
 	}
 
 	static NOT_TLS := 0
@@ -517,10 +518,13 @@ class ClientSocketTLS extends SocketTCP {
 	}
 
 	StartTLS() {
+		this.EventProcUnregister()
+
 		this.CreateCred()
 		this.ClientHello()
-
 		this.HandshakeLoop()
+		
+		this.EventProcRegister(this.FD_READ | this.FD_CLOSE)
 	}
 
 	Send(pBuffer, Size) {
@@ -571,5 +575,67 @@ class ClientSocketTLS extends SocketTCP {
 			, "UInt")
 		
 		this.RawSend(&MessageBuffer, this.HeaderSize + Size + this.TrailerSize)
+	}
+
+	Recv(ByRef UserBuffer, BufferSize := 0, Flags := 0) {
+		if (this.State != ClientSocketTLS.TLS) {
+			return 0
+		}
+
+		DataSize := this.MsgSize()
+		
+		VarSetCapacity(Data, DataSize)
+
+		this.RawRecv(Data, DataSize)
+
+		static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
+		static SIZEOF_SECBUFFER     := 8 + A_PtrSize
+
+		VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC, 0)
+		VarSetCapacity(OutBuffers, SIZEOF_SECBUFFER * 4, 0)
+
+		static SECBUFFER_EMPTY := 0
+		static SECBUFFER_DATA := 1
+		static SECBUFFER_STREAM_TRAILER := 6
+		static SECBUFFER_STREAM_HEADER := 7
+
+		NumPut(DataSize      , OutBuffers, 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_DATA, OutBuffers, 4, "UInt") ; SecBuffer.Type = 
+		NumPut(&Data         , OutBuffers, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
+		NumPut(4                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
+		NumPut(&OutBuffers      , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+
+		Status := DllCall("Secur32.dll\DecryptMessage"
+			, "Ptr", this.GetAddress("ContextHandle")
+			, "Ptr", &OutDesc
+			, "Ptr", 0
+			, "Ptr", 0)
+
+		if (Status = this.SEC_E_INCOMPLETE_MESSAGE) {
+			return 0
+		}
+		else if (Status = this.SEC_E_OK) {
+			loop, % 4 {
+				Index := A_Index - 1
+				IndexOffset := Index * SIZEOF_SECBUFFER
+
+				Type := NumGet(OutBuffers, IndexOffset + 4, "UInt")
+
+				if (Type = SECBUFFER_DATA) {
+					PlainDataSize := NumGet(OutBuffers, IndexOffset, "UInt")
+					pPlainData := NumGet(OutBuffers, IndexOffset + 8, "Ptr")
+
+					Size := Min(BufferSize, PlainDataSize)
+
+					MoveMemory(&UserBuffer, pPlainData, Size)
+
+					return Size
+				}
+			}
+
+			Throw Exception("Decrypted message had no plain text data")
+		}
 	}
 }
