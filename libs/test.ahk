@@ -2,11 +2,11 @@
 
 A := new ClientSocketTLS("ball")
 
-A.Connect(["172.20.126.15", 8080])
+A.Connect(["172.29.14.24", 8080])
 
 A.OnRecv := Func("Recv")
 
-A.StartTLS()
+;A.StartTLS()
 Sleep, 1000
 
 
@@ -17,6 +17,10 @@ VarSetCapacity(SendBuffer, SendSize, 0)
 StrPut(T, &SendBuffer, "UTF-8")
 
 A.Send(&SendBuffer, SendSize)
+
+Sleep, 1000
+
+A.Disconnect()
 
 Recv(Sock) {
     Size := Sock.MsgSize()

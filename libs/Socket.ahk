@@ -258,7 +258,6 @@ MoveMemory(pTo, pFrom, Size) {
 	DllCall("RtlMoveMemory", "Ptr", pTo, "Ptr", pFrom, "UInt", Size)
 }
 
-
 class ClientSocketTLS extends SocketTCP {
 	BlockingRecv(pBuffer, Size, Flags = 0) {
 		VarSetCapacity(ReadSet, A_PtrSize + (64 * A_PtrSize), 0)
@@ -283,11 +282,7 @@ class ClientSocketTLS extends SocketTCP {
 		this.RawRecv := SocketTCP.Recv
 	}
 
-	static NOT_TLS := 0
-	static WAIT_FOR_SERVER_HELLO := 1
-	static TLS := 2
-
-	State := ClientSocketTLS.NOT_TLS
+	Secured := false
 
 	static SEC_E_OK := 0
 
@@ -384,8 +379,6 @@ class ClientSocketTLS extends SocketTCP {
 		this.RawSend(pData, Size)
 
 		DllCall("Secur32.dll\FreeContextBuffer", "Ptr", pData)
-
-		this.State := ClientSocketTLS.WAIT_FOR_SERVER_HELLO
 	}
 
 	static SEC_E_INCOMPLETE_MESSAGE := 0x80090318
@@ -514,7 +507,7 @@ class ClientSocketTLS extends SocketTCP {
 
 		this.MaxPayloadSize := this.MaximumMessageSize - this.HeaderSize - this.TrailerSize
 
-		this.State := ClientSocketTLS.TLS
+		this.Secured := true
 	}
 
 	StartTLS() {
@@ -527,8 +520,22 @@ class ClientSocketTLS extends SocketTCP {
 		this.EventProcRegister(this.FD_READ | this.FD_CLOSE)
 	}
 
+	Connect(Address, MaybePort := "", HostName := "") {
+		if (HostName) {
+			this.HostName := HostName
+		}
+
+		if (!IsObject(Address)) {
+			Address := [Address, MaybePort]
+		}
+
+		SocketTCP.Connect.Call(this, Address)
+
+		this.StartTLS()
+	}
+
 	Send(pBuffer, Size) {
-		if (this.State != ClientSocketTLS.TLS) {
+		if (!this.Secured) {
 			Throw Exception("The TLS handshake has not been completed, and data cannot be safely sent over the socket")
 		}
 
@@ -573,6 +580,10 @@ class ClientSocketTLS extends SocketTCP {
 			, "Ptr", &OutDesc
 			, "Ptr", 0
 			, "UInt")
+
+		if (Status != this.SEC_E_OK) {
+			Throw Exception("ApplyControlToken failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+		}
 		
 		this.RawSend(&MessageBuffer, this.HeaderSize + Size + this.TrailerSize)
 	}
@@ -637,5 +648,80 @@ class ClientSocketTLS extends SocketTCP {
 
 			Throw Exception("Decrypted message had no plain text data")
 		}
+		else {
+			Throw Exception("DecryptMessage failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+		}
+	}
+
+	StopTLS() {
+		static SIZEOF_SECBUFFERDESC := 8 + A_PtrSize
+		static SIZEOF_SECBUFFER     := 8 + A_PtrSize
+
+		static SECBUFFER_TOKEN := 2
+		static SCHANNEL_SHUTDOWN := 1
+
+		VarSetCapacity(OutDesc, SIZEOF_SECBUFFERDESC, 0)
+		VarSetCapacity(OutBuffer, SIZEOF_SECBUFFER, 0)
+		VarSetCapacity(ControlToken, 4, 0)
+
+		NumPut(SCHANNEL_SHUTDOWN, ControlToken, 0, "UInt")
+
+		NumPut(4              , OutBuffer, 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_TOKEN, OutBuffer, 4, "UInt") ; SecBuffer.Type = 
+		NumPut(&ControlToken  , OutBuffer, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		NumPut(SECBUFFER_VERSION, OutDesc, 0, "UInt") ; SecBufferDesc.Version =
+		NumPut(1                , OutDesc, 4, "UInt") ; SecBufferDesc.Count =
+		NumPut(&OutBuffer       , OutDesc, 8, "Ptr")  ; SecBufferDesc.Data =
+
+		Status := DllCall("Secur32.dll\ApplyControlToken"
+			, "Ptr", this.GetAddress("ContextHandle")
+			, "Ptr", &OutDesc)
+
+		if (Status & 0x80000000) {
+			Throw Exception("ApplyControlToken failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+		}
+
+		NumPut(0              , OutBuffer, 0, "UInt") ; SecBuffer.Size = 
+		NumPut(SECBUFFER_TOKEN, OutBuffer, 4, "UInt") ; SecBuffer.Type = 
+		NumPut(0              , OutBuffer, 8, "Ptr")  ; SecBuffer.Ptr = 
+
+		Status := DllCall("Secur32.dll\InitializeSecurityContext"
+			, "Ptr", this.GetAddress("CredHandle")
+			, "Ptr", this.GetAddress("ContextHandle")
+			, "Ptr", 0
+			, "UInt", this.Flags
+			, "Ptr", 0
+			, "Ptr", 0
+			, "Ptr", 0
+			, "Ptr", 0
+			, "Ptr", 
+			, "Ptr", &OutDesc
+			, "UInt*", OutFlags
+			, "Ptr", this.GetAddress("TimeStamp")
+			, "UInt")
+		
+		if (Status & 0x80000000) {
+			Throw Exception("InitializeSecurityContext failed, error code " Format("{:x}", Status & 0xFFFFFFFF))
+		}
+
+		Size := NumGet(OutBuffer, 0, "UInt")
+		pData := NumGet(OutBuffer, 8, "Ptr")
+
+		if (Size && pData) {
+			this.RawSend(pData, Size)
+			DllCall("Secur32.dll\FreeContextBuffer", "Ptr", pData)
+		}
+	}
+
+	CleanUp() {
+		DllCall("Secur32.dll\DeleteSecurityContext", "Ptr", this.GetAddress("ContextHandle"))
+	}
+
+	Disconnect() {
+		this.StopTLS()
+		this.CleanUp()
+		
+		SocketTCP.Disconnect.Call(this)
 	}
 }
